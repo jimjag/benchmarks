@@ -4,6 +4,10 @@
 #include <unistd.h>
 #include <stdint.h>
 #include <semaphore.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/sem.h>
+
 
 // contact: attractor@live.co.uk
 
@@ -28,6 +32,10 @@ static pthread_spinlock_t g_spin;
 static pthread_mutex_t g_mutex;
 static sem_t g_sem;
 static volatile uint8_t g_lock2;
+static struct sembuf proc_mutex_op_on;
+static struct sembuf proc_mutex_op_try;
+static struct sembuf proc_mutex_op_off;
+static int semid;
 
 void *worker(void *data)
 {
@@ -126,6 +134,15 @@ void *worker(void *data)
 		for (j = 0; j < z; ++j) w->bits[buf[j]>>6] ^= 1LLU << (buf[j]&0x3f);
 		pthread_mutex_unlock(&g_mutex);
 		free(buf);
+	} else if (w->type == 8) { // SysV sem
+		for (i = w->start, nm = (int64_t)w->n * w->m; i < nm; i += w->step) {
+			uint64_t x = slow_comp(i, w->n);
+			uint64_t *p = &w->bits[x>>6];
+			uint64_t y = 1LLU << (x & 0x3f);
+			semop(semid, &proc_mutex_op_on, 1);
+			*p ^= y;
+			semop(semid, &proc_mutex_op_off, 1);
+		}
 	}
 	return 0;
 }
@@ -137,6 +154,15 @@ int main(int argc, char *argv[])
 	worker_t *w, w0;
 	pthread_t *tid;
 	pthread_attr_t attr;
+	proc_mutex_op_on.sem_num = 0;
+	proc_mutex_op_on.sem_op = -1;
+	proc_mutex_op_on.sem_flg = SEM_UNDO;
+	proc_mutex_op_try.sem_num = 0;
+	proc_mutex_op_try.sem_op = -1;
+	proc_mutex_op_try.sem_flg = SEM_UNDO | IPC_NOWAIT;
+	proc_mutex_op_off.sem_num = 0;
+	proc_mutex_op_off.sem_op = 1;
+	proc_mutex_op_off.sem_flg = SEM_UNDO;
 
 	w0.n = 1000000; w0.m = 100; w0.type = 1; w0.start = 0; w0.step = 1;
 	while ((c = getopt(argc, argv, "t:n:s:m:l:")) >= 0) {
@@ -150,7 +176,7 @@ int main(int argc, char *argv[])
 	fprintf(stderr, "Usage: lock_test [-t nThreads=%d] [-n size=%d] [-m repeat=%d] [-l lockType=%d]\n",
 			n_threads, w0.n, w0.m, w0.type);
 	fprintf(stderr, "Lock type: 0 for single-thread; 1 for gcc builtin; 2 for spin lock; 3 for pthread spin; 4 for mutex;\n");
-	fprintf(stderr, "           5 for semaphore; 6 for buffer+spin; 7 for buffer+mutex\n");
+	fprintf(stderr, "           5 for semaphore; 6 for buffer+spin; 7 for buffer+mutex; 8 for SysV sem\n");
 
 	w0.bits = (uint64_t*)calloc((w0.n + 63) / 64, 8);
 
@@ -163,6 +189,7 @@ int main(int argc, char *argv[])
 	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
 	tid = alloca(sizeof(pthread_t) * n_threads);
 	w = alloca(sizeof(worker_t) * n_threads);
+	int semid = semget(IPC_PRIVATE, 1, IPC_CREAT | 0600);
 	for (i = 0; i < n_threads; ++i) {
 		w[i] = w0;
 		w[i].start = i; w[i].step = n_threads;
